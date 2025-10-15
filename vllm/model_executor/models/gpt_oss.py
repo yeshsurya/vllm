@@ -720,3 +720,14 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+    
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Params for weights, weight scales, activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        return FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_local_experts,
+            num_redundant_experts=0,
+        )
