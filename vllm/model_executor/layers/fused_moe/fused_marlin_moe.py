@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+from collections.abc import Callable
+
 import torch
 from typing_extensions import override
 
@@ -9,6 +11,9 @@ import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+    MoEPrepareAndFinalizeNoEP,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -19,7 +24,21 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     maybe_warn_marlin_atomic_add,
 )
 from vllm.scalar_type import ScalarType, scalar_types
-from vllm.utils import direct_register_custom_op
+
+
+def default_activation_func(
+    activation: str | None, output: torch.Tensor, input: torch.Tensor
+) -> None:
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(output, input)
+    elif activation == "swigluoai":
+        # alpha = 1.702, limit = 7.0
+        torch.ops._C.swigluoai_and_mul(output, input)
+    else:
+        raise ValueError(
+            f"Unsupported activation: {activation}. "
+            "Only silu and swigluoai activations are supported."
+        )
 
 
 def fused_marlin_moe(
@@ -37,6 +56,10 @@ def fused_marlin_moe(
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
     activation: str | None = "silu",
+    activation_func: Callable[
+        [str | None, torch.Tensor, torch.Tensor], None
+    ] = default_activation_func,
+    moe_sum: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
     expert_map: torch.Tensor | None = None,
     global_scale1: torch.Tensor | None = None,
     global_scale2: torch.Tensor | None = None,
@@ -185,20 +208,9 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if activation == "silu":
-        torch.ops._C.silu_and_mul(
-            intermediate_cache2, intermediate_cache1.view(-1, 2 * N)
-        )
-    elif activation == "swigluoai":
-        # alpha = 1.702, limit = 7.0
-        torch.ops._C.swigluoai_and_mul(
-            intermediate_cache2, intermediate_cache1.view(-1, 2 * N)
-        )
-    else:
-        raise ValueError(
-            f"Unsupported activation: {activation}. "
-            "Only silu and swigluoai activations are supported."
-        )
+    activation_func(
+        activation, intermediate_cache2, intermediate_cache1.view(-1, 2 * N)
+    )
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -238,45 +250,10 @@ def fused_marlin_moe(
         else:
             output = torch.empty_like(hidden_states)
 
-    return torch.sum(intermediate_cache3.view(-1, topk, K), dim=1, out=output)
-
-
-def fused_marlin_moe_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    gating_output: torch.Tensor | None,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    quant_type_id: int,
-    apply_router_weight_on_input: bool = False,
-    global_num_experts: int = -1,
-    global_scale1: torch.Tensor | None = None,
-    global_scale2: torch.Tensor | None = None,
-    expert_map: torch.Tensor | None = None,
-    g_idx1: torch.Tensor | None = None,
-    g_idx2: torch.Tensor | None = None,
-    sort_indices1: torch.Tensor | None = None,
-    sort_indices2: torch.Tensor | None = None,
-    w1_zeros: torch.Tensor | None = None,
-    w2_zeros: torch.Tensor | None = None,
-    workspace: torch.Tensor | None = None,
-    intermediate_cache13: torch.Tensor | None = None,
-    intermediate_cache2: torch.Tensor | None = None,
-    is_k_full: bool = True,
-    output: torch.Tensor | None = None,
-    inplace: bool = False,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="fused_marlin_moe",
-    op_func=fused_marlin_moe,
-    fake_impl=fused_marlin_moe_fake,
-)
+    if moe_sum is None:
+        return torch.sum(intermediate_cache3.view(-1, topk, K), dim=1, out=output)
+    else:
+        return moe_sum(intermediate_cache3, output)
 
 
 class MarlinExperts(mk.FusedMoEPermuteExpertsUnpermute):
@@ -397,6 +374,8 @@ class MarlinExperts(mk.FusedMoEPermuteExpertsUnpermute):
             apply_router_weight_on_input=apply_router_weight_on_input,
             global_num_experts=global_num_experts,
             activation=activation,
+            activation_func=self.activation,
+            moe_sum=self.moe_sum,
             expert_map=expert_map,
             output=output,
             # Workspaces are swapped in workspace_shapes() to account for proper
@@ -404,3 +383,16 @@ class MarlinExperts(mk.FusedMoEPermuteExpertsUnpermute):
             intermediate_cache13=workspace2,
             intermediate_cache2=workspace13,
         )
+
+    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        ops.moe_sum(input, output)
+
+
+def modular_marlin_fused_moe(
+    quant_config: FusedMoEQuantConfig, shared_experts: torch.nn.Module | None = None
+) -> mk.FusedMoEModularKernel:
+    return mk.FusedMoEModularKernel(
+        MoEPrepareAndFinalizeNoEP(),
+        MarlinExperts(quant_config),
+        shared_experts,
+    )
